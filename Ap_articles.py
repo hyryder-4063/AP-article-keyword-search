@@ -1,14 +1,19 @@
-from os import remove
-
 import pandas as pd
 from datetime import datetime
 import time
 from nltk.stem import PorterStemmer
 ps = PorterStemmer()
+from collections import Counter
+import math
 
 
 class Article:
     all_articles = []  # Class level list to store all articles
+    index_title = []
+    index_excerpt = []
+    total_articles = 0
+
+
 
     def __init__(self, date="", link="", title="", core_message="", excerpt="", suggested_by=""):
         self.date = date
@@ -17,6 +22,10 @@ class Article:
         self.core_message = str(core_message)
         self.excerpt = excerpt
         self.suggested_by = suggested_by
+        self.index_title = Counter()
+        self.index_excerpt = Counter()
+        self.total_words = len(str(self.excerpt).split())
+
 
     def __str__(self):
         if self.date:
@@ -35,6 +44,17 @@ class Article:
 
         return (
             f"ID: Date: {self.date} | Link: {clickable_link} | Title: {self.title} | Core_message: {self.core_message} | Excerpt: {self.excerpt} | Suggested_by: {self.suggested_by}")
+
+
+    def prepare_index(self):
+        """Precompute stemmed, lowercase searchable words for fast lookup."""
+        title_words = [ps.stem(word) for word in str(self.title).lower().split()]
+        self.index_title = Counter(title_words)
+        excerpt_words = [ps.stem(word) for word in str(self.excerpt).lower().split()]
+        self.index_excerpt = Counter(excerpt_words)
+
+
+
 
     @classmethod
     def add_article(cls, article_obj):
@@ -70,7 +90,9 @@ for i, row in df.iterrows():
 
     #Create article object
     Article.add_article(article_obj)
+    article_obj.prepare_index()
 
+Article.total_articles = len(Article.all_articles)
 #Print all article objects
 print(f"Searched in {len(Article.all_articles)} articles.")
 
@@ -83,7 +105,7 @@ def keyword_search(keywords:str, time:datetime = datetime.now()):
     keywords_clean = [ps.stem(word) for word in (keywords.lower().split())]  # Split search string into separate keywords
     # remove words from search string that should not be searched
 
-    ignore_list = {
+    ignore_dict = {
         "prepositions": [
             "in", "on", "at", "by", "for", "with", "about", "against", "between", "into", "through",
             "during", "before", "after", "above", "below", "to", "from", "up", "down", "over", "under",
@@ -117,10 +139,15 @@ def keyword_search(keywords:str, time:datetime = datetime.now()):
         ]
     }
 
-    ignore_words = (word for category in ignore_list.values() for word in category)
+    ignore_words = {ps.stem(word) for category in ignore_dict.values() for word in category}
 
     article_count_list = []  # Track total keyword hit in each article
     total_matched_articles = 0 #number of articles with a search hit
+    number_of_docs_with_keyword =[]
+    term_frequency_list = []
+    tf=[]
+    tfidf = []
+
 
     for article in Article.all_articles:
         article_count = 0
@@ -131,37 +158,53 @@ def keyword_search(keywords:str, time:datetime = datetime.now()):
         if(article.date and article.date > time): #Picks articles in the user's timeframe
 
             for keyword in keywords_clean:
+                keyword_count =0
 
                 if keyword in ignore_words:
                     continue
                 else:
-                    # Count in title
-                    for word in str(article.title).lower().split():
-                        if ps.stem(word) == keyword:
-                            article_count += 1
-
-                    # Count in excerpt
-                    for word in str(article.excerpt).lower().split():
-                        if ps.stem(word) == keyword:
-                            article_count += 1
+                    # Count in title and excerpt
+                    keyword_count += article.index_title.get(keyword, 0)
+                    keyword_count += article.index_excerpt.get(keyword, 0)
+                    article_count += article.index_title.get(keyword, 0)
+                    article_count += article.index_excerpt.get(keyword, 0)
+                    tf.append({"Keyword": keyword, "Article": article, "tf": keyword_count/ article.total_words}) #Number of times a keyword appears in this article/total number of words in this article
+                    number_of_docs_with_keyword.append({"Keyword": keyword, "Article": article.title })
 
             article_count_list.append({
                 "title": article.title,
                 "link": article.link,
                 "count": article_count
             })
-        
+
+
+
         if article_count > 0:
             total_matched_articles+=1
-        
+
+    for keyword in keywords_clean:
+
+        df = Counter(
+            item["Keyword"] for item in number_of_docs_with_keyword)  # Number of articles in which this keyword appears
+        df_value = df.get(keyword, 1)
+        idf = math.log(Article.total_articles / df_value)
+
+        for article in Article.all_articles:
+            tf_value = 0.0
+            tf_value = next((item["tf"] for item in tf if item["Keyword"] == keyword and item["Article"] == article),0.0)
+            tfidf.append(
+                {"Keyword": keyword, "Title": article.title, "Link": article.link, "TFIDF": tf_value * idf})
+
     # Sort articles by total keyword count
-    sorted_articles = sorted(article_count_list, key=lambda x: x["count"],
-                             reverse=True)  # Sort articles by frequency of keywords
+    # sorted_articles = sorted(article_count_list, key=lambda x: x["count"],
+    #                          reverse=True)  # Sort articles by frequency of keywords
+
+    sorted_articles = sorted(tfidf, key=lambda x: x["TFIDF"], reverse=True)  # Sort articles by frequency of keywords
 
     # Take top N articles
 
-    top_articles = sorted_articles[:min(number_of_links, len(sorted_articles))]
-    links = [article["link"] for article in top_articles]
+    top_articles = sorted_articles[:min(number_of_links, total_matched_articles)] #removes articles with 0 match or when matches <number of links
+    links = [article["Link"] for article in top_articles]
 
     return {"top_articles": top_articles, "total_matched_articles": total_matched_articles}
 
@@ -169,10 +212,13 @@ start_time = time.time()
 search_result=keyword_search("belief and/or loving", datetime(2025, 5, 31))
 end_time = time.time()
 
-print(f"Took {round(end_time-start_time,5)} seconds to find {search_result['total_matched_articles']} relevant articles. Top articles are: ")
+if search_result["total_matched_articles"] == 0:
+    print("Sorry! No relevant articles found. Try searching for something else.")
+else:
+    print(f"Took {round(end_time-start_time,5)} seconds to find {search_result['total_matched_articles']} relevant articles. Top articles are: ")
 
-for i, art in enumerate(search_result["top_articles"], 1):
-    print(f" {i}. Article Title: {art['title']}, Link: {art['link']}, Matches: {art['count']}")
+    for i, art in enumerate(search_result["top_articles"], 1):
+        print(f" {i}. Article Title: {art['Title']}, Link: {art['Link']}, TFIDF score is: {art['TFIDF']} ")
 
     
 
